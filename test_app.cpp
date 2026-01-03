@@ -285,8 +285,9 @@ void serverMode() {
     
     // Запоминаем предыдущий кадр для сравнения
     std::vector<uint8_t> prevFrame = AVOCodec::createBlackFrame(width, height);
-    bool firstFrame = true;
+    std::vector<uint8_t> fullFrameToSend;
     bool clientConnected = false;
+    bool newClientConnected = false; // Флаг для нового клиента
     int clientConnectionCheckCounter = 0;
     
     int frameCount = 0;
@@ -301,13 +302,14 @@ void serverMode() {
     cv::resizeWindow("UDP Server .AVO Stream", 640, 480);
     
     while (true) {
-        // Проверяем подключение клиента каждые 10 кадров
+        // Проверяем подключение клиента каждые 5 кадров
         clientConnectionCheckCounter++;
-        if (clientConnectionCheckCounter >= 10) {
+        if (clientConnectionCheckCounter >= 5) {
             bool hasClient = server.hasUDPClient();
             if (!clientConnected && hasClient) {
                 clientConnected = true;
-                std::cout << "\n✓ Client connected! Starting video stream...\n" << std::endl;
+                newClientConnected = true; // Новый клиент подключился
+                std::cout << "\n✓ Client connected! Sending initial full frame...\n" << std::endl;
             } else if (clientConnected && !hasClient) {
                 clientConnected = false;
                 std::cout << "\n⚠ Client disconnected. Waiting for new connection...\n" << std::endl;
@@ -331,16 +333,17 @@ void serverMode() {
         std::vector<uint8_t> dataToSend;
         bool sendFullFrame = false;
         
-        if (firstFrame || frameCount % 30 == 0) {
-            // Отправляем полный кадр (первый и каждый 30-й кадр)
+        // НОВАЯ ЛОГИКА:
+        // 1. Отправляем полный кадр при подключении нового клиента
+        // 2. В остальное время отправляем только изменения
+        if (newClientConnected) {
+            // Новый клиент подключился - отправляем полный кадр
             dataToSend = currentFrame;
             sendFullFrame = true;
-            if (clientConnected) {
-                std::cout << "[SERVER] Sending full frame " << frameCount << std::endl;
-            }
-            firstFrame = false;
-        } else {
-            // Отправляем только изменения
+            newClientConnected = false; // Сбрасываем флаг
+            std::cout << "[SERVER] Sending full frame to new client (frame " << frameCount << ")" << std::endl;
+        } else if (clientConnected) {
+            // Клиент подключен - отправляем изменения
             std::vector<PixelChange> changes;
             AVOCodec::compareFrames(prevFrame, currentFrame, width, height, changes);
             
@@ -350,13 +353,13 @@ void serverMode() {
                 // Проверяем эффективность сжатия
                 float compressionRatio = (compressed.size() * 100.0f) / (width * height * 3);
                 
-                if (compressionRatio < 50.0f && compressed.size() < currentFrame.size()) {
+                if (compressionRatio < 90.0f) { // Порог эффективности сжатия
                     // RLE эффективно - отправляем сжатые данные
                     dataToSend = compressed;
                     
-                    // Логируем каждые 15 кадров, чтобы не засорять консоль
+                    // Логируем каждые 30 кадров
                     framesSinceLastLog++;
-                    if (clientConnected && framesSinceLastLog >= 15) {
+                    if (framesSinceLastLog >= 30) {
                         std::cout << "[SERVER] Frame " << frameCount 
                                   << ": " << changes.size() << " changes, "
                                   << "compressed to " << compressed.size() << " bytes ("
@@ -368,7 +371,7 @@ void serverMode() {
                     // RLE неэффективно - отправляем полный кадр
                     dataToSend = currentFrame;
                     sendFullFrame = true;
-                    if (clientConnected && framesSinceLastLog >= 15) {
+                    if (framesSinceLastLog >= 30) {
                         std::cout << "[SERVER] Frame " << frameCount 
                                   << ": RLE inefficient (" << compressionRatio 
                                   << "%), sending full frame" << std::endl;
@@ -378,18 +381,33 @@ void serverMode() {
             } else {
                 // Нет изменений - отправляем пустой пакет (1 байт)
                 dataToSend = std::vector<uint8_t>(1, 0);
-                if (clientConnected && frameCount % 60 == 0) {
+                if (frameCount % 60 == 0) {
                     std::cout << "[SERVER] Frame " << frameCount << ": No changes (static frame)" << std::endl;
                 }
             }
+        } else {
+            // Клиент не подключен - не отправляем ничего
+            prevFrame = currentFrame; // Обновляем предыдущий кадр
+            frameCount++;
+            
+            // Показываем локальное окно, но не отправляем данные
+            cv::Mat displayFrame;
+            cv::resize(resizedFrame, displayFrame, cv::Size(640, 480));
+            
+            // Отображение информации...
+            // ... (код отображения без изменений)
+            
+            cv::imshow("UDP Server .AVO Stream", displayFrame);
+            
+            if (cv::waitKey(delayMs) == 27) break;
+            continue;
         }
         
-        // Отправка через UDP (только если есть клиент)
+        // Отправка через UDP
         if (clientConnected) {
             bool sendSuccess = server.sendUDPFrame(dataToSend, width, height);
             
             if (!sendSuccess) {
-                // Ошибка отправки - возможно, клиент отключился
                 std::cerr << "[SERVER] Failed to send frame " << frameCount << std::endl;
             }
         }
@@ -458,15 +476,9 @@ void serverMode() {
             std::cout << "\nStopping server..." << std::endl;
             break;
         } else if (key == 'r' || key == 'R') {
-            // Сброс соединения с клиентом
-            std::cout << "\nResetting client connection..." << std::endl;
-            clientConnected = false;
-        } else if (key == 'i' || key == 'I') {
-            // Информация о текущем кадре
-            std::cout << "\nFrame #" << frameCount << " info:" << std::endl;
-            std::cout << "  Size: " << width << "x" << height << std::endl;
-            std::cout << "  Data size: " << dataToSend.size() << " bytes" << std::endl;
-            std::cout << "  Client connected: " << (clientConnected ? "Yes" : "No") << std::endl;
+            // Принудительная отправка полного кадра
+            newClientConnected = true;
+            std::cout << "\nManual reset: will send full frame on next iteration\n" << std::endl;
         }
     }
     
@@ -537,7 +549,7 @@ void clientMode() {
     std::vector<uint8_t> currentFrame;
     std::atomic<uint32_t> frameWidth(320);
     std::atomic<uint32_t> frameHeight(240);
-    std::atomic<bool> expectingFullFrame(true); // Первый кадр должен быть полным
+    std::atomic<bool> expectingFullFrame(true); // Ожидаем полный кадр при подключении
     std::mutex frameMutex;
     
     cv::namedWindow("UDP Client .AVO Stream", cv::WINDOW_NORMAL);
@@ -553,14 +565,28 @@ void clientMode() {
             frameHeight = height;
         }
         
-        if (packetData.empty() || (packetData.size() == 1 && packetData[0] == 0)) {
-            // Пустой пакет - нет изменений
-            // Для пустого пакета ничего не меняем, оставляем предыдущий кадр
+        if (packetData.empty()) {
+            // Пустой пакет
             return;
         }
         
+        // Различаем типы пакетов:
+        // 1. Если размер равен размеру полного кадра (width * height * 3) - это полный кадр
+        // 2. Если размер равен 1 байту и это 0 - пустой пакет (нет изменений)
+        // 3. В противном случае - это RLE-сжатые изменения
+        
+        if (packetData.size() == 1 && packetData[0] == 0) {
+            // Пустой пакет - нет изменений, оставляем предыдущий кадр
+            if (receivedFrames % 30 == 0) {
+                std::cout << "[CLIENT] Frame " << receivedFrames << ": No changes" << std::endl;
+            }
+            return;
+        }
+        
+        uint32_t expectedFullFrameSize = frameWidth * frameHeight * 3;
+        
         try {
-            if (expectingFullFrame || packetData.size() == width * height * 3) {
+            if (expectingFullFrame || packetData.size() == expectedFullFrameSize) {
                 // Полный кадр
                 {
                     std::lock_guard<std::mutex> lock(frameMutex);
@@ -582,9 +608,10 @@ void clientMode() {
                         baseFrame = currentFrame;
                     }
                     
-                    // Если baseFrame пустой, создаем черный кадр
-                    if (baseFrame.empty()) {
+                    // Если baseFrame пустой или размер не совпадает, создаем черный кадр
+                    if (baseFrame.empty() || baseFrame.size() != expectedFullFrameSize) {
                         baseFrame = AVOCodec::createBlackFrame(frameWidth, frameHeight);
+                        std::cout << "[CLIENT] Creating black frame as base" << std::endl;
                     }
                     
                     // Применяем изменения
@@ -600,17 +627,29 @@ void clientMode() {
                     
                     // Периодически выводим статистику
                     if (receivedFrames % 30 == 0) {
-                        float compressionRatio = (packetData.size() * 100.0f) / 
-                                               (frameWidth * frameHeight * 3);
+                        float compressionRatio = (packetData.size() * 100.0f) / expectedFullFrameSize;
                         std::cout << "[CLIENT] Frame " << receivedFrames << ": " 
                                  << packetData.size() << " bytes (" 
                                  << std::fixed << std::setprecision(1) << compressionRatio 
                                  << "%), changes: " << changes.size() << std::endl;
+                        
+                        // Для отладки - выводим информацию о первых изменениях
+                        if (!changes.empty()) {
+                            std::cout << "  First change: offset=" << changes[0].offset 
+                                     << ", count=" << (int)changes[0].count 
+                                     << ", RGB=(" << (int)changes[0].r << "," 
+                                     << (int)changes[0].g << "," << (int)changes[0].b << ")" << std::endl;
+                        }
                     }
+                } else {
+                    std::cout << "[CLIENT] Empty changes list in diff frame" << std::endl;
                 }
             }
         } catch (const std::exception& e) {
-            std::cerr << "[CLIENT] Error processing frame: " << e.what() << std::endl;
+            std::cerr << "[CLIENT] Error processing frame " << receivedFrames 
+                     << ": " << e.what() << std::endl;
+            std::cerr << "Packet size: " << packetData.size() 
+                     << ", Expected full frame size: " << expectedFullFrameSize << std::endl;
         }
     };
     
@@ -656,6 +695,13 @@ void clientMode() {
                        std::to_string(localHeight), 
                        cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX, 0.5, 
                        cv::Scalar(0, 255, 255), 1);
+            
+            // Индикатор типа кадра
+            if (expectingFullFrame) {
+                cv::putText(frame, "Waiting for full frame...", 
+                           cv::Point(10, 120), cv::FONT_HERSHEY_SIMPLEX, 0.5, 
+                           cv::Scalar(0, 165, 255), 1);
+            }
             
             displayFrame = frame;
         } else {

@@ -201,18 +201,19 @@ std::vector<uint8_t> AVOCodec::compressRLE(const std::vector<PixelChange>& chang
     std::vector<uint8_t> result;
     
     for (const auto& change : changes) {
-        if (change.count == 1) {
-            // Для одиночных пикселей: 3 байта RGB
-            result.push_back(change.r);
-            result.push_back(change.g);
-            result.push_back(change.b);
-        } else {
-            // Для RLE: 1 байт count + 3 байта RGB
-            result.push_back(change.count);
-            result.push_back(change.r);
-            result.push_back(change.g);
-            result.push_back(change.b);
-        }
+        // Записываем offset (4 байта) в сетевом порядке байт
+        uint32_t netOffset = htonl(change.offset);
+        result.insert(result.end(), 
+                     reinterpret_cast<const uint8_t*>(&netOffset), 
+                     reinterpret_cast<const uint8_t*>(&netOffset) + 4);
+        
+        // Записываем count (1 байт)
+        result.push_back(change.count);
+        
+        // Записываем RGB (3 байта)
+        result.push_back(change.r);
+        result.push_back(change.g);
+        result.push_back(change.b);
     }
     
     return result;
@@ -225,35 +226,26 @@ std::vector<PixelChange> AVOCodec::decompressRLE(const std::vector<uint8_t>& dat
         return changes;
     }
     
-    uint32_t currentOffset = 0;
     size_t i = 0;
     
-    while (i < data.size()) {
+    while (i + 8 <= data.size()) { // 4 байта offset + 1 байт count + 3 байта RGB = 8 байт
         PixelChange change;
-        change.offset = currentOffset;
         
-        if (i + 3 <= data.size()) {
-            // Проверяем, является ли первый байт счетчиком RLE (>1)
-            if (data[i] > 1 && data[i] <= 255) {
-                // RLE запись: count + RGB
-                change.count = data[i++];
-                change.r = data[i++];
-                change.g = data[i++];
-                change.b = data[i++];
-                currentOffset += change.count;
-            } else {
-                // Одиночный пиксель: RGB
-                change.count = 1;
-                change.r = data[i++];
-                change.g = data[i++];
-                change.b = data[i++];
-                currentOffset += 1;
-            }
-            
-            changes.push_back(change);
-        } else {
-            break;
-        }
+        // Читаем offset
+        uint32_t netOffset;
+        memcpy(&netOffset, &data[i], 4);
+        i += 4;
+        change.offset = ntohl(netOffset);
+        
+        // Читаем count
+        change.count = data[i++];
+        
+        // Читаем RGB
+        change.r = data[i++];
+        change.g = data[i++];
+        change.b = data[i++];
+        
+        changes.push_back(change);
     }
     
     return changes;
