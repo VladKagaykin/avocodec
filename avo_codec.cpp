@@ -4,6 +4,12 @@
 #include <cstring>
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <chrono>
 
 #ifdef _WIN32
     #include <winsock2.h>
@@ -12,6 +18,13 @@
     #include <arpa/inet.h>
     #include <netinet/in.h>
 #endif
+
+// Вспомогательная функция для получения размера файла
+static long long getFileSize(const std::string& filename) {
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) return 0;
+    return static_cast<long long>(file.tellg());
+}
 
 bool AVOCodec::encodeFirstFrame(const std::vector<uint8_t>& frameData, 
                                uint32_t width, uint32_t height, 
@@ -59,9 +72,29 @@ bool AVOCodec::decodeFirstFrame(const std::string& filename,
     return true;
 }
 
+// Старая версия без задержки
 bool AVOCodec::encodeFrameDiff(const std::vector<uint8_t>& prevFrame,
                               const std::vector<uint8_t>& currFrame,
                               uint32_t width, uint32_t height,
+                              const std::string& filename) {
+    // Используем задержку по умолчанию 33ms (30 FPS)
+    return encodeFrameDiff(prevFrame, currFrame, width, height, 33, filename);
+}
+
+// Старая версия без задержки
+bool AVOCodec::decodeFrameDiff(const std::string& filename,
+                              const std::vector<uint8_t>& prevFrame,
+                              std::vector<uint8_t>& currFrame,
+                              uint32_t width, uint32_t height) {
+    uint32_t delayMs;
+    return decodeFrameDiff(filename, prevFrame, currFrame, width, height, delayMs);
+}
+
+// Новая версия с задержкой
+bool AVOCodec::encodeFrameDiff(const std::vector<uint8_t>& prevFrame,
+                              const std::vector<uint8_t>& currFrame,
+                              uint32_t width, uint32_t height,
+                              uint32_t delayMs,
                               const std::string& filename) {
     if (prevFrame.size() != currFrame.size()) {
         std::cerr << "Frame sizes don't match!" << std::endl;
@@ -84,9 +117,16 @@ bool AVOCodec::encodeFrameDiff(const std::vector<uint8_t>& prevFrame,
         return false;
     }
     
-    uint32_t numChanges = static_cast<uint32_t>(compressed.size());
-    file.write(reinterpret_cast<const char*>(&numChanges), sizeof(numChanges));
+    // Сохраняем задержку (4 байта)
+    uint32_t netDelayMs = htonl(delayMs);
+    file.write(reinterpret_cast<const char*>(&netDelayMs), sizeof(netDelayMs));
     
+    // Сохраняем размер данных (4 байта)
+    uint32_t dataSize = static_cast<uint32_t>(compressed.size());
+    uint32_t netDataSize = htonl(dataSize);
+    file.write(reinterpret_cast<const char*>(&netDataSize), sizeof(netDataSize));
+    
+    // Сохраняем данные
     if (!compressed.empty()) {
         file.write(reinterpret_cast<const char*>(compressed.data()), compressed.size());
     }
@@ -95,18 +135,27 @@ bool AVOCodec::encodeFrameDiff(const std::vector<uint8_t>& prevFrame,
     return true;
 }
 
+// Новая версия с задержкой
 bool AVOCodec::decodeFrameDiff(const std::string& filename,
                               const std::vector<uint8_t>& prevFrame,
                               std::vector<uint8_t>& currFrame,
-                              uint32_t width, uint32_t height) {
+                              uint32_t width, uint32_t height,
+                              uint32_t& delayMs) {
     std::ifstream file(filename, std::ios::binary);
     if (!file.is_open()) {
         std::cerr << "Cannot open file: " << filename << std::endl;
         return false;
     }
     
-    uint32_t dataSize;
-    file.read(reinterpret_cast<char*>(&dataSize), sizeof(dataSize));
+    // Читаем задержку
+    uint32_t netDelayMs;
+    file.read(reinterpret_cast<char*>(&netDelayMs), sizeof(netDelayMs));
+    delayMs = ntohl(netDelayMs);
+    
+    // Читаем размер данных
+    uint32_t netDataSize;
+    file.read(reinterpret_cast<char*>(&netDataSize), sizeof(netDataSize));
+    uint32_t dataSize = ntohl(netDataSize);
     
     if (dataSize == 0) {
         currFrame = prevFrame;
@@ -264,19 +313,24 @@ void AVOCodec::applyChanges(const std::vector<uint8_t>& baseFrame,
     uint32_t totalPixels = width * height;
     
     for (const auto& change : changes) {
+        // Проверяем, не выходит ли offset за границы
         if (change.offset >= totalPixels) {
             continue;
         }
         
+        // Применяем изменение для каждого пикселя в count
         for (uint8_t i = 0; i < change.count; i++) {
             uint32_t pixelPos = change.offset + i;
             
+            // Проверяем, не выходит ли текущий пиксель за границы
             if (pixelPos >= totalPixels) {
                 break;
             }
             
+            // Вычисляем индекс в массиве RGB
             size_t idx = pixelPos * 3;
             
+            // Проверяем, не выходит ли индекс за границы массива
             if (idx + 2 < resultFrame.size()) {
                 resultFrame[idx] = change.r;
                 resultFrame[idx + 1] = change.g;
@@ -382,5 +436,194 @@ bool AVOCodec::parseNetworkPacket(const std::vector<uint8_t>& packet,
     data.resize(dataSize);
     memcpy(data.data(), packet.data() + 24, dataSize);
     
+    return true;
+}
+
+// Исправленная функция для создания архива с реальными задержками
+bool AVOCodec::encodeVideoArchive(const std::vector<AVOFrame>& frames,
+                                 uint32_t width, uint32_t height, 
+                                 uint32_t fps, const std::string& filename) {
+    if (frames.empty()) {
+        std::cerr << "No frames to encode!" << std::endl;
+        return false;
+    }
+    
+    std::ofstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Cannot create archive: " << filename << std::endl;
+        return false;
+    }
+    
+    // Заголовок архива
+    AVOHeader header;
+    header.width = width;
+    header.height = height;
+    header.fps = 0; // НЕ используем FPS, так как у нас реальные задержки
+    header.totalFrames = static_cast<uint32_t>(frames.size());
+    header.firstFrameSize = static_cast<uint32_t>(frames[0].data.size());
+    
+    file.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    
+    // Сохраняем первый кадр (полный)
+    AVOFrame firstFrame = frames[0];
+    if (!firstFrame.isFullFrame) {
+        std::cerr << "First frame must be full frame!" << std::endl;
+        file.close();
+        return false;
+    }
+    
+    // Сохраняем задержку первого кадра
+    uint32_t netFirstDelay = htonl(firstFrame.delayMs);
+    file.write(reinterpret_cast<const char*>(&netFirstDelay), sizeof(netFirstDelay));
+    
+    // Сохраняем первый кадр
+    file.write(reinterpret_cast<const char*>(firstFrame.data.data()), firstFrame.data.size());
+    
+    // Сохраняем остальные кадры как изменения
+    std::vector<uint8_t> prevFrame = firstFrame.data;
+    
+    for (size_t i = 1; i < frames.size(); i++) {
+        const AVOFrame& frame = frames[i];
+        
+        // Получаем текущий кадр
+        std::vector<uint8_t> currFrame;
+        if (frame.isFullFrame) {
+            currFrame = frame.data;
+        } else {
+            std::vector<PixelChange> changes = decompressRLE(frame.data);
+            applyChanges(prevFrame, changes, currFrame, width, height);
+        }
+        
+        // Находим разницу между кадрами
+        std::vector<PixelChange> changes;
+        compareFrames(prevFrame, currFrame, width, height, changes);
+        
+        // Сжимаем изменения
+        std::vector<uint8_t> compressed = compressRLE(changes);
+        
+        // Сохраняем тип кадра (1 байт): 0 = изменения, 1 = полный кадр
+        uint8_t frameType = frame.isFullFrame ? 1 : 0;
+        file.write(reinterpret_cast<const char*>(&frameType), sizeof(frameType));
+        
+        // Сохраняем реальную задержку (4 байта)
+        uint32_t netDelay = htonl(frame.delayMs);
+        file.write(reinterpret_cast<const char*>(&netDelay), sizeof(netDelay));
+        
+        // Сохраняем размер сжатых данных (4 байта)
+        uint32_t dataSize = static_cast<uint32_t>(compressed.size());
+        uint32_t netDataSize = htonl(dataSize);
+        file.write(reinterpret_cast<const char*>(&netDataSize), sizeof(netDataSize));
+        
+        // Сохраняем сжатые данные
+        if (!compressed.empty()) {
+            file.write(reinterpret_cast<const char*>(compressed.data()), compressed.size());
+        }
+        
+        // Обновляем предыдущий кадр для следующей итерации
+        prevFrame = currFrame;
+    }
+    
+    file.close();
+    
+    // Статистика
+    long long totalRawSize = width * height * 3 * frames.size();
+    long long archiveSize = getFileSize(filename);
+    float compressionRatio = (archiveSize * 100.0f) / totalRawSize;
+    
+    std::cout << "Archive created: " << filename << std::endl;
+    std::cout << "  Frames: " << frames.size() << std::endl;
+    std::cout << "  Raw size: " << totalRawSize << " bytes" << std::endl;
+    std::cout << "  Archive size: " << archiveSize << " bytes" << std::endl;
+    std::cout << "  Compression: " << std::fixed << std::setprecision(1) 
+              << compressionRatio << "%" << std::endl;
+    
+    return true;
+}
+
+// Исправленная функция для чтения архива с реальными задержками
+bool AVOCodec::decodeVideoArchive(const std::string& filename,
+                                 std::vector<AVOFrame>& frames,
+                                 AVOHeader& header) {
+    std::ifstream file(filename, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "Cannot open archive: " << filename << std::endl;
+        return false;
+    }
+    
+    // Читаем заголовок
+    file.read(reinterpret_cast<char*>(&header), sizeof(header));
+    
+    frames.clear();
+    frames.reserve(header.totalFrames);
+    
+    // Читаем первый кадр (полный)
+    AVOFrame firstFrame;
+    
+    // Читаем задержку первого кадра
+    uint32_t netFirstDelay;
+    file.read(reinterpret_cast<char*>(&netFirstDelay), sizeof(netFirstDelay));
+    firstFrame.delayMs = ntohl(netFirstDelay);
+    firstFrame.isFullFrame = true;
+    
+    // Читаем первый кадр
+    firstFrame.data.resize(header.firstFrameSize);
+    file.read(reinterpret_cast<char*>(firstFrame.data.data()), header.firstFrameSize);
+    
+    frames.push_back(firstFrame);
+    
+    // Читаем остальные кадры
+    std::vector<uint8_t> prevFrame = firstFrame.data;
+    
+    for (uint32_t i = 1; i < header.totalFrames; i++) {
+        AVOFrame frame;
+        frame.isFullFrame = true; // После декодирования это будет полный кадр
+        
+        // Читаем тип кадра
+        uint8_t frameType;
+        file.read(reinterpret_cast<char*>(&frameType), sizeof(frameType));
+        bool wasDiffFrame = (frameType == 0);
+        
+        // Читаем реальную задержку
+        uint32_t netDelay;
+        file.read(reinterpret_cast<char*>(&netDelay), sizeof(netDelay));
+        frame.delayMs = ntohl(netDelay);
+        
+        // Читаем размер данных
+        uint32_t netDataSize;
+        file.read(reinterpret_cast<char*>(&netDataSize), sizeof(netDataSize));
+        uint32_t dataSize = ntohl(netDataSize);
+        
+        if (dataSize > 0) {
+            // Читаем сжатые данные
+            std::vector<uint8_t> compressedData(dataSize);
+            file.read(reinterpret_cast<char*>(compressedData.data()), dataSize);
+            
+            if (wasDiffFrame) {
+                // Декомпрессируем изменения
+                std::vector<PixelChange> changes = decompressRLE(compressedData);
+                
+                // Применяем изменения к предыдущему кадру
+                std::vector<uint8_t> currFrame;
+                applyChanges(prevFrame, changes, currFrame, header.width, header.height);
+                
+                // Обновляем данные кадра
+                frame.data = currFrame;
+                
+                // Обновляем предыдущий кадр для следующей итерации
+                prevFrame = currFrame;
+            } else {
+                // Это был полный кадр
+                frame.data = compressedData;
+                prevFrame = compressedData;
+            }
+        } else {
+            // Нет изменений - используем предыдущий кадр
+            frame.data = prevFrame;
+        }
+        
+        frames.push_back(frame);
+    }
+    
+    file.close();
     return true;
 }

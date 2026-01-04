@@ -26,6 +26,12 @@ struct PixelChange {
     uint8_t count;       // Количество повторений (RLE)
 };
 
+struct AVOFrame {
+    std::vector<uint8_t> data;  // данные кадра или изменения
+    uint32_t delayMs;           // задержка перед следующим кадром в миллисекундах
+    bool isFullFrame;           // true = полный кадр, false = изменения
+};
+
 class AVOCodec {
 public:
     // Кодирование/декодирование .avo файлов
@@ -47,6 +53,19 @@ public:
                                const std::vector<uint8_t>& prevFrame,
                                std::vector<uint8_t>& currFrame,
                                uint32_t width, uint32_t height);
+    
+    // Новые версии с задержкой
+    static bool encodeFrameDiff(const std::vector<uint8_t>& prevFrame,
+                               const std::vector<uint8_t>& currFrame,
+                               uint32_t width, uint32_t height,
+                               uint32_t delayMs,
+                               const std::string& filename);
+    
+    static bool decodeFrameDiff(const std::string& filename,
+                               const std::vector<uint8_t>& prevFrame,
+                               std::vector<uint8_t>& currFrame,
+                               uint32_t width, uint32_t height,
+                               uint32_t& delayMs);
     
     // Вспомогательные функции
     static std::vector<uint8_t> compressRLE(const std::vector<PixelChange>& changes);
@@ -85,6 +104,15 @@ public:
                                   uint32_t& totalPackets,
                                   uint32_t& width,
                                   uint32_t& height);
+    
+    // Функции для архива
+    static bool encodeVideoArchive(const std::vector<AVOFrame>& frames,
+                                  uint32_t width, uint32_t height, 
+                                  uint32_t fps, const std::string& filename);
+    
+    static bool decodeVideoArchive(const std::string& filename,
+                                  std::vector<AVOFrame>& frames,
+                                  AVOHeader& header);
 };
 
 #endif // AVO_CODEC_H
